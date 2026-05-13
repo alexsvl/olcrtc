@@ -145,7 +145,7 @@ func (s *Session) sendTelemetry(ctx context.Context, endpoint, event string) {
 		"peerId":         s.peerID,
 		"roomId":         s.roomID,
 		"displayName":    s.name,
-		"implementation": "olcrtc-go",
+		"implementation": "browser",
 		"dataChannel": map[string]any{
 			"bufferedAmount": s.GetBufferedAmount(),
 			"sendQueue":      len(s.sendQueue),
