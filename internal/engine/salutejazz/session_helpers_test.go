@@ -162,6 +162,35 @@ func TestSendPublisherTrackAddWritesJazzPayload(t *testing.T) {
 	assertJazzTrackAddPayload(t, msg[keyPayload])
 }
 
+func TestJazzICECandidatePayload(t *testing.T) {
+	sdpMid := "0"
+	sdpMLineIndex := uint16(1)
+	usernameFragment := "ufrag-1"
+
+	got := jazzICECandidatePayload(webrtc.ICECandidateInit{
+		Candidate:        "candidate:1 1 udp 1 127.0.0.1 12345 typ host",
+		SDPMid:           &sdpMid,
+		SDPMLineIndex:    &sdpMLineIndex,
+		UsernameFragment: &usernameFragment,
+	}, "PUBLISHER")
+
+	if got["candidate"] != "candidate:1 1 udp 1 127.0.0.1 12345 typ host" {
+		t.Fatalf("candidate = %v", got["candidate"])
+	}
+	if got["sdpMid"] != "0" {
+		t.Fatalf("sdpMid = %v, want 0", got["sdpMid"])
+	}
+	if got["sdpMLineIndex"] != uint16(1) {
+		t.Fatalf("sdpMLineIndex = %v, want 1", got["sdpMLineIndex"])
+	}
+	if got["usernameFragment"] != "ufrag-1" {
+		t.Fatalf("usernameFragment = %v, want ufrag-1", got["usernameFragment"])
+	}
+	if got["target"] != "PUBLISHER" {
+		t.Fatalf("target = %v, want PUBLISHER", got["target"])
+	}
+}
+
 func assertJazzTrackAddEnvelope(t *testing.T, msg map[string]any) {
 	t.Helper()
 

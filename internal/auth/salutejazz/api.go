@@ -30,7 +30,8 @@ const (
 	contentTypeJSON   = "application/json"
 	jazzOrigin        = "https://salutejazz.ru"
 	jazzReferer       = jazzOrigin + "/"
-	jazzUA            = "osName=Linux;osVersion=;appName=jazz;appVersion=26.21.7;surface=WEB;browserName=Firefox;browserVersion=150.0"
+	jazzUA            = "osName=Linux;osVersion=;appName=jazz;appVersion=26.21.7;" +
+		"surface=WEB;browserName=Firefox;browserVersion=150.0"
 )
 
 var apiBase = "https://bk.salutejazz.ru" //nolint:gochecknoglobals // package-level state intentional
