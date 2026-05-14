@@ -40,6 +40,7 @@ const (
 	payloadSDP    = "sdp"
 	payloadAnswer = "answer"
 	payloadOffer  = "offer"
+	payloadMuted  = "muted"
 	methodOffer   = "rtc:offer"
 
 	trackTypeAudio = "AUDIO"
@@ -85,39 +86,41 @@ var (
 
 // Session is the SaluteJazz engine handle.
 type Session struct {
-	name            string
-	connectorURL    string
-	roomID          string
-	password        string
-	ws              *websocket.Conn
-	wsMu            sync.Mutex
-	pcSub           *webrtc.PeerConnection
-	pcPub           *webrtc.PeerConnection
-	dc              *webrtc.DataChannel
-	onData          func([]byte)
-	onReconnect     func(*webrtc.DataChannel)
-	shouldReconnect func() bool
-	reconnectCh     chan struct{}
-	closeCh         chan struct{}
-	closed          atomic.Bool
-	reconnecting    atomic.Bool
-	sendQueue       chan []byte
-	sendQueueClosed atomic.Bool
-	onEnded         func(string)
-	sessionCloseCh  chan struct{}
-	videoTrackMu    sync.RWMutex
-	videoTracks     []webrtc.TrackLocal
-	audioTrack      *webrtc.TrackLocalStaticSample
-	onVideoTrack    func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
-	subscriberReady atomic.Bool
-	publisherReady  atomic.Bool
-	videoOffered    atomic.Bool
-	subscriberConn  chan struct{}
-	publisherConn   chan struct{}
-	videoNegotiated chan struct{}
-	wg              sync.WaitGroup
-	groupIDMu       sync.RWMutex
-	groupID         string
+	name             string
+	connectorURL     string
+	roomID           string
+	password         string
+	ws               *websocket.Conn
+	wsMu             sync.Mutex
+	pcSub            *webrtc.PeerConnection
+	pcPub            *webrtc.PeerConnection
+	dc               *webrtc.DataChannel
+	onData           func([]byte)
+	onReconnect      func(*webrtc.DataChannel)
+	shouldReconnect  func() bool
+	reconnectCh      chan struct{}
+	closeCh          chan struct{}
+	closed           atomic.Bool
+	reconnecting     atomic.Bool
+	sendQueue        chan []byte
+	sendQueueClosed  atomic.Bool
+	onEnded          func(string)
+	sessionCloseCh   chan struct{}
+	videoTrackMu     sync.RWMutex
+	videoTracks      []webrtc.TrackLocal
+	audioTrack       *webrtc.TrackLocalStaticSample
+	onVideoTrack     func(*webrtc.TrackRemote, *webrtc.RTPReceiver)
+	subscriberReady  atomic.Bool
+	publisherReady   atomic.Bool
+	publisherStarted atomic.Bool
+	cameraUnmuted    atomic.Bool
+	videoOffered     atomic.Bool
+	subscriberConn   chan struct{}
+	publisherConn    chan struct{}
+	videoNegotiated  chan struct{}
+	wg               sync.WaitGroup
+	groupIDMu        sync.RWMutex
+	groupID          string
 }
 
 // New creates a new SaluteJazz engine session.
@@ -163,6 +166,8 @@ func (s *Session) Capabilities() engine.Capabilities {
 func (s *Session) resetMediaState() {
 	s.subscriberReady.Store(false)
 	s.publisherReady.Store(false)
+	s.publisherStarted.Store(false)
+	s.cameraUnmuted.Store(false)
 	s.videoOffered.Store(false)
 	s.subscriberConn = make(chan struct{})
 	s.publisherConn = make(chan struct{})
@@ -585,6 +590,8 @@ func (s *Session) handleMediaOut(payload map[string]any) {
 		s.handlePublisherAnswer(payload)
 	case "rtc:ice":
 		s.handleICE(payload)
+	case "rtc:participants:update":
+		s.handleParticipantsUpdate(payload)
 	}
 }
 
@@ -666,7 +673,9 @@ func (s *Session) handleSubscriberOffer(payload map[string]any) {
 	s.wsMu.Unlock()
 
 	time.Sleep(subscriberOfferGap)
-	s.sendPublisherOffer()
+	if s.publisherStarted.CompareAndSwap(false, true) {
+		s.sendPublisherOffer()
+	}
 }
 
 func (s *Session) sendPublisherOffer() {
@@ -724,7 +733,7 @@ func (s *Session) sendPublisherVideoOffer() {
 		if track == nil || track.Kind() != webrtc.RTPCodecTypeVideo {
 			continue
 		}
-		if err := s.sendPublisherTrackAdd(trackTypeVideo, trackSourceCam, false); err != nil {
+		if err := s.sendPublisherTrackAdd(trackTypeVideo, trackSourceCam, true); err != nil {
 			logger.Debugf("send publisher video track add error: %v", err)
 			return
 		}
@@ -798,6 +807,77 @@ func (s *Session) sendPublisherTrackAdd(trackType, source string, muted bool) er
 		},
 	}); err != nil {
 		return fmt.Errorf("write track add json: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) handleParticipantsUpdate(payload map[string]any) {
+	if !s.hasLocalVideoTracks() || !s.videoOffered.Load() {
+		return
+	}
+
+	track, ok := publisherCameraTrack(payload)
+	if !ok {
+		return
+	}
+
+	if muted, _ := track[payloadMuted].(bool); !muted {
+		s.cameraUnmuted.Store(true)
+		return
+	}
+
+	sid, _ := track["sid"].(string)
+	if sid == "" || !s.cameraUnmuted.CompareAndSwap(false, true) {
+		return
+	}
+	if err := s.sendTrackMuted(sid, false); err != nil {
+		logger.Debugf("[salutejazz] send camera unmute error: %v", err)
+	}
+}
+
+func publisherCameraTrack(payload map[string]any) (map[string]any, bool) {
+	update, _ := payload["update"].(map[string]any)
+	participants, _ := update["participants"].([]any)
+	for _, rawParticipant := range participants {
+		participant, _ := rawParticipant.(map[string]any)
+		if isPublisher, ok := participant["isPublisher"].(bool); ok && !isPublisher {
+			continue
+		}
+
+		tracks, _ := participant["tracks"].([]any)
+		for _, rawTrack := range tracks {
+			track, _ := rawTrack.(map[string]any)
+			trackType, _ := track[payloadType].(string)
+			source, _ := track["source"].(string)
+			if trackType != trackTypeVideo || source != trackSourceCam {
+				continue
+			}
+
+			return track, true
+		}
+	}
+
+	return nil, false
+}
+
+func (s *Session) sendTrackMuted(sid string, muted bool) error {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+
+	if err := s.ws.WriteJSON(map[string]any{
+		keyRoomID:    s.roomID,
+		keyEvent:     eventMediaIn,
+		keyGroupID:   s.getGroupID(),
+		keyRequestID: uuid.New().String(),
+		keyPayload: map[string]any{
+			payloadMethod: "rtc:track:muted",
+			"mute": map[string]any{
+				"sid":        sid,
+				payloadMuted: muted,
+			},
+		},
+	}); err != nil {
+		return fmt.Errorf("write track muted json: %w", err)
 	}
 	return nil
 }

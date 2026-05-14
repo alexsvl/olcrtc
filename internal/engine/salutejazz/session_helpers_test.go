@@ -11,7 +11,10 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const testJazzGroupID = "group-1"
+const (
+	testJazzGroupID = "group-1"
+	testJazzRoomID  = "room-1"
+)
 
 //nolint:cyclop // table-driven test naturally has many branches
 func TestSessionStateHelpers(t *testing.T) {
@@ -149,7 +152,7 @@ func TestSendPublisherTrackAddWritesJazzPayload(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	s := &Session{
-		roomID:  "room-1",
+		roomID:  testJazzRoomID,
 		groupID: testJazzGroupID,
 		ws:      conn,
 	}
@@ -160,6 +163,68 @@ func TestSendPublisherTrackAddWritesJazzPayload(t *testing.T) {
 	msg := <-msgCh
 	assertJazzTrackAddEnvelope(t, msg)
 	assertJazzTrackAddPayload(t, msg[keyPayload])
+}
+
+func TestHandleParticipantsUpdateUnmutesCameraTrack(t *testing.T) {
+	msgCh := make(chan map[string]any, 1)
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		var msg map[string]any
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Errorf("read json: %v", err)
+			return
+		}
+		msgCh <- msg
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[len("http"):]
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	s := &Session{
+		roomID:      testJazzRoomID,
+		groupID:     testJazzGroupID,
+		ws:          conn,
+		videoTracks: []webrtc.TrackLocal{nil},
+	}
+	s.videoOffered.Store(true)
+	s.handleParticipantsUpdate(map[string]any{
+		"update": map[string]any{
+			"participants": []any{
+				map[string]any{
+					"isPublisher": true,
+					"tracks": []any{
+						map[string]any{
+							"sid":        "TR_CAMERA_1",
+							"type":       "VIDEO",
+							"source":     "CAMERA",
+							payloadMuted: true,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	msg := <-msgCh
+	assertJazzTrackAddEnvelope(t, msg)
+	assertJazzTrackMutedPayload(t, msg[keyPayload])
 }
 
 func TestJazzICECandidatePayload(t *testing.T) {
@@ -194,8 +259,8 @@ func TestJazzICECandidatePayload(t *testing.T) {
 func assertJazzTrackAddEnvelope(t *testing.T, msg map[string]any) {
 	t.Helper()
 
-	if msg[keyRoomID] != "room-1" {
-		t.Fatalf("roomId = %v, want room-1", msg[keyRoomID])
+	if msg[keyRoomID] != testJazzRoomID {
+		t.Fatalf("roomId = %v, want %s", msg[keyRoomID], testJazzRoomID)
 	}
 	if msg[keyEvent] != eventMediaIn {
 		t.Fatalf("event = %v, want %s", msg[keyEvent], eventMediaIn)
@@ -226,7 +291,30 @@ func assertJazzTrackAddPayload(t *testing.T, raw any) {
 	if track["source"] != "CAMERA" {
 		t.Fatalf("source = %v, want CAMERA", track["source"])
 	}
-	if track["muted"] != false {
-		t.Fatalf("muted = %v, want false", track["muted"])
+	if track[payloadMuted] != false {
+		t.Fatalf("muted = %v, want false", track[payloadMuted])
+	}
+}
+
+func assertJazzTrackMutedPayload(t *testing.T, raw any) {
+	t.Helper()
+
+	payload, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("payload missing or wrong type: %+v", raw)
+	}
+	if payload[payloadMethod] != "rtc:track:muted" {
+		t.Fatalf("%s = %v, want rtc:track:muted", payloadMethod, payload[payloadMethod])
+	}
+
+	mute, ok := payload["mute"].(map[string]any)
+	if !ok {
+		t.Fatalf("mute missing or wrong type: %+v", payload["mute"])
+	}
+	if mute["sid"] != "TR_CAMERA_1" {
+		t.Fatalf("sid = %v, want TR_CAMERA_1", mute["sid"])
+	}
+	if mute[payloadMuted] != false {
+		t.Fatalf("muted = %v, want false", mute[payloadMuted])
 	}
 }
