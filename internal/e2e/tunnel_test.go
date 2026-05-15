@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -533,6 +535,26 @@ func realRoomURL(ctx context.Context, t *testing.T, carrierName string) string {
 	}
 }
 
+// perSubtestRoomURL adds a fresh random suffix to the jitsi room slug for
+// each subtest so subtests don't share a MUC — cross-subtest RTP echo from
+// closed peer connections was leaking into the next subtest's transport and
+// poisoning its handshake. Other carriers create real rooms server-side and
+// already get unique ids per matrix entry, so they're left untouched.
+func perSubtestRoomURL(carrierName, roomURL string) string {
+	if carrierName != "jitsi" {
+		return roomURL
+	}
+	var b [4]byte
+	suffix := fmt.Sprintf("%08x", time.Now().UnixNano())
+	if _, err := cryptorand.Read(b[:]); err == nil {
+		suffix = hex.EncodeToString(b[:])
+	}
+	if i := strings.LastIndex(roomURL, "/"); i >= 0 {
+		return roomURL[:i+1] + roomURL[i+1:] + "-" + suffix
+	}
+	return roomURL + "-" + suffix
+}
+
 func requireRealRoom(ctx context.Context, t *testing.T, carrierName string) string {
 	t.Helper()
 
@@ -1013,7 +1035,8 @@ func TestRealProviderTransportMatrix(t *testing.T) {
 					}
 					expectation := realE2ECaseExpectation(carrierName, transportName)
 					label := realE2EExpectationLabel(expectation)
-					err := runRealE2ECase(t, carrierName, transportName, roomURL, echoAddr)
+					caseRoomURL := perSubtestRoomURL(carrierName, roomURL)
+					err := runRealE2ECase(t, carrierName, transportName, caseRoomURL, echoAddr)
 					if err != nil && errors.Is(err, carrier.ErrAuthFailed) {
 						authFailed = true
 						t.Skipf("skip %s real e2e: auth failed: %v", carrierName, err)

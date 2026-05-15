@@ -32,7 +32,7 @@ const (
 	maxSendAttempts              = 4
 	sampleBuilderMaxLate         = 128
 	protocolMagic         uint32 = 0x4f564331 // OVC1
-	protocolVersion       byte   = 1
+	protocolVersion       byte   = 2
 	frameTypeData         byte   = 1
 	frameTypeAck          byte   = 2
 )
@@ -60,6 +60,7 @@ var (
 
 type transportFrame struct {
 	typ       byte
+	channelID uint32
 	seq       uint32
 	crc       uint32
 	totalLen  uint32
@@ -76,27 +77,29 @@ type inboundMessage struct {
 }
 
 type streamTransport struct {
-	stream        carrier.VideoTrack
-	track         *webrtc.TrackLocalStaticSample
-	onData        func([]byte)
-	outbound      chan []byte
-	outboundAck   chan []byte
-	closeCh       chan struct{}
-	writerDone    chan struct{}
-	nextSeq       atomic.Uint32
-	closed        atomic.Bool
-	writerUp      atomic.Bool
-	sendMu        sync.Mutex
-	startWriter   sync.Once
-	ackMu         sync.Mutex
-	ackWaiters    map[uint32]chan uint32
-	recvMu        sync.Mutex
-	inbound       map[uint32]*inboundMessage
-	delivered     map[uint32]uint32
-	fragmentSize  int
-	ackTimeout    time.Duration
-	frameInterval time.Duration
-	batchSize     int
+	stream          carrier.VideoTrack
+	track           *webrtc.TrackLocalStaticSample
+	onData          func([]byte)
+	outbound        chan []byte
+	outboundAck     chan []byte
+	closeCh         chan struct{}
+	writerDone      chan struct{}
+	nextSeq         atomic.Uint32
+	closed          atomic.Bool
+	writerUp        atomic.Bool
+	localChannelID  uint32
+	peerChannelID   atomic.Uint32
+	sendMu          sync.Mutex
+	startWriter     sync.Once
+	ackMu           sync.Mutex
+	ackWaiters      map[uint32]chan uint32
+	recvMu          sync.Mutex
+	inbound         map[uint32]*inboundMessage
+	delivered       map[uint32]uint32
+	fragmentSize    int
+	ackTimeout      time.Duration
+	frameInterval   time.Duration
+	batchSize       int
 }
 
 // New creates a seichannel transport backed by a carrier.
@@ -160,20 +163,21 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	}
 
 	tr := &streamTransport{
-		stream:        stream,
-		track:         track,
-		onData:        cfg.OnData,
-		outbound:      make(chan []byte, 256),
-		outboundAck:   make(chan []byte, 64),
-		closeCh:       make(chan struct{}),
-		writerDone:    make(chan struct{}),
-		ackWaiters:    make(map[uint32]chan uint32),
-		inbound:       make(map[uint32]*inboundMessage),
-		delivered:     make(map[uint32]uint32),
-		fragmentSize:  fragmentSize,
-		ackTimeout:    ackTimeout,
-		frameInterval: time.Second / time.Duration(fps),
-		batchSize:     batchSize,
+		stream:         stream,
+		track:          track,
+		onData:         cfg.OnData,
+		outbound:       make(chan []byte, 256),
+		outboundAck:    make(chan []byte, 64),
+		closeCh:        make(chan struct{}),
+		writerDone:     make(chan struct{}),
+		localChannelID: newChannelID(),
+		ackWaiters:     make(map[uint32]chan uint32),
+		inbound:        make(map[uint32]*inboundMessage),
+		delivered:      make(map[uint32]uint32),
+		fragmentSize:   fragmentSize,
+		ackTimeout:     ackTimeout,
+		frameInterval:  time.Second / time.Duration(fps),
+		batchSize:      batchSize,
 	}
 
 	err = stream.AddTrack(track)
@@ -227,7 +231,7 @@ func (p *streamTransport) Send(data []byte) error {
 
 	for range maxSendAttempts {
 		for idx, fragment := range fragments {
-			frame := encodeDataFrame(seq, crc, len(data), idx, len(fragments), fragment)
+			frame := encodeDataFrame(p.localChannelID, seq, crc, len(data), idx, len(fragments), fragment)
 			if err := p.enqueueFrame(frame, false); err != nil {
 				return err
 			}
@@ -442,6 +446,14 @@ func (p *streamTransport) handleSample(sample []byte) {
 			continue
 		}
 
+		// Multi-party MUCs (e.g. Jitsi) can deliver frames from other
+		// peers — or RTP echo from previously-closed sessions — to our
+		// PeerConnection. The first valid frame we see fixes the peer's
+		// channelID; later frames with a different ID are silently dropped.
+		if !p.acceptChannel(frame.channelID) {
+			continue
+		}
+
 		switch frame.typ {
 		case frameTypeAck:
 			p.resolveAck(frame.seq, frame.crc)
@@ -449,6 +461,16 @@ func (p *streamTransport) handleSample(sample []byte) {
 			p.handleInboundFrame(frame)
 		}
 	}
+}
+
+func (p *streamTransport) acceptChannel(id uint32) bool {
+	if id == 0 {
+		return false
+	}
+	if p.peerChannelID.CompareAndSwap(0, id) {
+		return true
+	}
+	return p.peerChannelID.Load() == id
 }
 
 func (p *streamTransport) upsertInbound(frame transportFrame) (*inboundMessage, bool) {
@@ -520,7 +542,7 @@ func (p *streamTransport) handleInboundFrame(frame transportFrame) {
 }
 
 func (p *streamTransport) sendAck(seq, crc uint32) {
-	_ = p.enqueueFrame(encodeAckFrame(seq, crc), true)
+	_ = p.enqueueFrame(encodeAckFrame(p.localChannelID, seq, crc), true)
 }
 
 func (p *streamTransport) resolveAck(seq, crc uint32) {
@@ -555,27 +577,29 @@ func fragmentPayload(data []byte, maxSize int) [][]byte {
 	return out
 }
 
-func encodeDataFrame(seq, crc uint32, totalLen, fragIdx, fragTotal int, payload []byte) []byte {
-	out := make([]byte, 22+len(payload))
+func encodeDataFrame(channelID, seq, crc uint32, totalLen, fragIdx, fragTotal int, payload []byte) []byte {
+	out := make([]byte, 26+len(payload))
 	binary.BigEndian.PutUint32(out[0:4], protocolMagic)
 	out[4] = protocolVersion
 	out[5] = frameTypeData
-	binary.BigEndian.PutUint32(out[6:10], seq)
-	binary.BigEndian.PutUint32(out[10:14], crc)
-	binary.BigEndian.PutUint32(out[14:18], uint32(totalLen)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
-	binary.BigEndian.PutUint16(out[18:20], uint16(fragIdx)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
-	binary.BigEndian.PutUint16(out[20:22], uint16(fragTotal)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
-	copy(out[22:], payload)
+	binary.BigEndian.PutUint32(out[6:10], channelID)
+	binary.BigEndian.PutUint32(out[10:14], seq)
+	binary.BigEndian.PutUint32(out[14:18], crc)
+	binary.BigEndian.PutUint32(out[18:22], uint32(totalLen)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
+	binary.BigEndian.PutUint16(out[22:24], uint16(fragIdx)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
+	binary.BigEndian.PutUint16(out[24:26], uint16(fragTotal)) //nolint:gosec,lll // G115: bounded conversion verified by surrounding logic
+	copy(out[26:], payload)
 	return out
 }
 
-func encodeAckFrame(seq, crc uint32) []byte {
-	out := make([]byte, 14)
+func encodeAckFrame(channelID, seq, crc uint32) []byte {
+	out := make([]byte, 18)
 	binary.BigEndian.PutUint32(out[0:4], protocolMagic)
 	out[4] = protocolVersion
 	out[5] = frameTypeAck
-	binary.BigEndian.PutUint32(out[6:10], seq)
-	binary.BigEndian.PutUint32(out[10:14], crc)
+	binary.BigEndian.PutUint32(out[6:10], channelID)
+	binary.BigEndian.PutUint32(out[10:14], seq)
+	binary.BigEndian.PutUint32(out[14:18], crc)
 	return out
 }
 
@@ -593,22 +617,24 @@ func decodeTransportFrame(data []byte) (transportFrame, error) {
 	frame := transportFrame{typ: data[5]}
 	switch frame.typ {
 	case frameTypeAck:
-		if len(data) < 14 {
+		if len(data) < 18 {
 			return transportFrame{}, ErrAckTooShort
 		}
-		frame.seq = binary.BigEndian.Uint32(data[6:10])
-		frame.crc = binary.BigEndian.Uint32(data[10:14])
+		frame.channelID = binary.BigEndian.Uint32(data[6:10])
+		frame.seq = binary.BigEndian.Uint32(data[10:14])
+		frame.crc = binary.BigEndian.Uint32(data[14:18])
 		return frame, nil
 	case frameTypeData:
-		if len(data) < 22 {
+		if len(data) < 26 {
 			return transportFrame{}, ErrDataTooShort
 		}
-		frame.seq = binary.BigEndian.Uint32(data[6:10])
-		frame.crc = binary.BigEndian.Uint32(data[10:14])
-		frame.totalLen = binary.BigEndian.Uint32(data[14:18])
-		frame.fragIdx = binary.BigEndian.Uint16(data[18:20])
-		frame.fragTotal = binary.BigEndian.Uint16(data[20:22])
-		frame.payload = append([]byte(nil), data[22:]...)
+		frame.channelID = binary.BigEndian.Uint32(data[6:10])
+		frame.seq = binary.BigEndian.Uint32(data[10:14])
+		frame.crc = binary.BigEndian.Uint32(data[14:18])
+		frame.totalLen = binary.BigEndian.Uint32(data[18:22])
+		frame.fragIdx = binary.BigEndian.Uint16(data[22:24])
+		frame.fragTotal = binary.BigEndian.Uint16(data[24:26])
+		frame.payload = append([]byte(nil), data[26:]...)
 		return frame, nil
 	default:
 		return transportFrame{}, ErrUnexpectedFrameType
@@ -624,4 +650,22 @@ func randomID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// newChannelID picks a non-zero random uint32 that tags every frame this
+// peer emits. The receiving side pins the first non-zero channelID it sees
+// and ignores frames carrying any other value, which is how we tell our
+// real partner apart from other MUC participants and from leftover RTP
+// echo of closed sessions.
+func newChannelID() uint32 {
+	var b [4]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return uint32(time.Now().UnixNano()) | 1 //nolint:gosec // G115: intentional truncation
+		}
+		id := binary.BigEndian.Uint32(b[:])
+		if id != 0 {
+			return id
+		}
+	}
 }

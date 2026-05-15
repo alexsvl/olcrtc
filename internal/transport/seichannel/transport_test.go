@@ -63,12 +63,13 @@ func TestSEIRoundTripThroughRTPPacketizerAndSampleBuilder(t *testing.T) {
 }
 
 func TestTransportFrameRoundTrip(t *testing.T) {
-	encoded := encodeDataFrame(42, 0xdeadbeef, 1024, 1, 3, []byte("chunk"))
+	encoded := encodeDataFrame(0xc0ffee, 42, 0xdeadbeef, 1024, 1, 3, []byte("chunk"))
 	decoded, err := decodeTransportFrame(encoded)
 	if err != nil {
 		t.Fatalf("decodeTransportFrame failed: %v", err)
 	}
-	if decoded.typ != frameTypeData || decoded.seq != 42 || decoded.crc != 0xdeadbeef {
+	if decoded.typ != frameTypeData || decoded.channelID != 0xc0ffee ||
+		decoded.seq != 42 || decoded.crc != 0xdeadbeef {
 		t.Fatalf("unexpected frame header: %+v", decoded)
 	}
 	if decoded.totalLen != 1024 || decoded.fragIdx != 1 || decoded.fragTotal != 3 {
