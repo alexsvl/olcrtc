@@ -4,7 +4,6 @@ package videochannel
 import (
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -56,8 +55,6 @@ type streamTransport struct {
 	nextSeq         atomic.Uint32
 	closed          atomic.Bool
 	writerUp        atomic.Bool
-	localChannelID  uint32
-	peerChannelID   atomic.Uint32
 	sendMu          sync.Mutex
 	startWriter     sync.Once
 	ackMu           sync.Mutex
@@ -141,7 +138,6 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		outboundAck:     make(chan []byte, 64),
 		closeCh:         make(chan struct{}),
 		writerDone:      make(chan struct{}),
-		localChannelID:  newChannelID(),
 		ackWaiters:      make(map[uint32]chan uint32),
 		inbound:         make(map[uint32]*inboundMessage),
 		delivered:       make(map[uint32]uint32),
@@ -226,7 +222,7 @@ func (p *streamTransport) Send(data []byte) error {
 
 	for range maxSendAttempts {
 		for idx, fragment := range fragments {
-			frame := encodeDataFrame(p.localChannelID, seq, crc, len(data), idx, len(fragments), fragment)
+			frame := encodeDataFrame(seq, crc, len(data), idx, len(fragments), fragment)
 			if err := p.enqueueFrame(frame, false); err != nil {
 				return err
 			}
@@ -547,30 +543,12 @@ func (p *streamTransport) handleFrame(frame []byte) {
 		return
 	}
 
-	// Multi-party MUCs (e.g. Jitsi) can deliver frames from other peers — or
-	// video echo from previously-closed sessions — to our PeerConnection.
-	// The first valid frame we see fixes the peer's channelID; later frames
-	// with a different ID are silently dropped.
-	if !p.acceptChannel(decoded.channelID) {
-		return
-	}
-
 	switch decoded.typ {
 	case frameTypeAck:
 		p.resolveAck(decoded.seq, decoded.crc)
 	case frameTypeData:
 		p.handleInboundFrame(decoded)
 	}
-}
-
-func (p *streamTransport) acceptChannel(id uint32) bool {
-	if id == 0 {
-		return false
-	}
-	if p.peerChannelID.CompareAndSwap(0, id) {
-		return true
-	}
-	return p.peerChannelID.Load() == id
 }
 
 func (p *streamTransport) upsertInbound(frame transportFrame) (*inboundMessage, bool) {
@@ -642,7 +620,7 @@ func (p *streamTransport) handleInboundFrame(frame transportFrame) {
 }
 
 func (p *streamTransport) sendAck(seq, crc uint32) {
-	_ = p.enqueueFrame(encodeAckFrame(p.localChannelID, seq, crc), true)
+	_ = p.enqueueFrame(encodeAckFrame(seq, crc), true)
 }
 
 func (p *streamTransport) resolveAck(seq, crc uint32) {
@@ -669,22 +647,4 @@ func randomID() string {
 		return fmt.Sprintf("%08x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b[:])
-}
-
-// newChannelID picks a non-zero random uint32 that tags every frame this
-// peer emits. The receiving side pins the first non-zero channelID it sees
-// and ignores frames carrying any other value, which is how we tell our
-// real partner apart from other MUC participants and from leftover video
-// echo of closed sessions.
-func newChannelID() uint32 {
-	var b [4]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			return uint32(time.Now().UnixNano()) | 1 //nolint:gosec // G115: intentional truncation
-		}
-		id := binary.BigEndian.Uint32(b[:])
-		if id != 0 {
-			return id
-		}
-	}
 }
