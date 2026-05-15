@@ -14,6 +14,7 @@ room:
   id: "https://meet.cryptopro.ru/REPLACE_WITH_ROOM_NAME"
 
 crypto:
+  # Or use key_file: "./olcrtc.key" to keep the secret out of this file.
   key: "REPLACE_ME_WITH_64_HEX_CHARS"   # must match the server
 
 net:

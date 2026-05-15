@@ -1,10 +1,9 @@
 // Package config loads olcrtc runtime configuration from YAML files.
 //
 // The YAML schema mirrors [session.Config]. Fields left unset in the file
-// remain at their zero value, allowing CLI flags to fill them in. Use
-// [Apply] to merge a parsed [File] onto an existing [session.Config];
-// non-zero fields in the session config (typically populated from CLI flags)
-// take precedence over the YAML values.
+// remain at their zero value. Use [Apply] to map a parsed [File] onto an
+// existing [session.Config]; non-zero fields in the session config take
+// precedence over the YAML values.
 //
 //nolint:tagliatelle // YAML keys are the documented config file schema.
 package config
@@ -13,17 +12,46 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/openlibrecommunity/olcrtc/internal/app/session"
 	"gopkg.in/yaml.v3"
 )
 
-// ErrConfigNotFound is returned when a config file path is set but the file does not exist.
-var ErrConfigNotFound = errors.New("config file not found")
+var (
+	// ErrConfigNotFound is returned when a config file path is set but the file does not exist.
+	ErrConfigNotFound = errors.New("config file not found")
+	// ErrCryptoKeyConflict is returned when both inline and file-backed keys are configured.
+	ErrCryptoKeyConflict = errors.New("crypto.key and crypto.key_file cannot both be set")
+	// ErrCryptoKeyFileEmpty is returned when crypto.key_file points to an empty file.
+	ErrCryptoKeyFileEmpty = errors.New("crypto key file is empty")
+)
 
 // File is the on-disk YAML schema.
 type File struct {
-	Mode   string `yaml:"mode"`
+	Mode     string    `yaml:"mode"`
+	Link     string    `yaml:"link"`
+	Auth     Auth      `yaml:"auth"`
+	Room     Room      `yaml:"room"`
+	Crypto   Crypto    `yaml:"crypto"`
+	Net      Net       `yaml:"net"`
+	SOCKS    SOCKS     `yaml:"socks"`
+	Engine   Engine    `yaml:"engine"`
+	Video    Video     `yaml:"video"`
+	VP8      VP8       `yaml:"vp8"`
+	SEI      SEI       `yaml:"sei"`
+	Gen      Gen       `yaml:"gen"`
+	Profiles []Profile `yaml:"profiles"`
+	Failover Failover  `yaml:"failover"`
+	Data     string    `yaml:"data"`
+	Debug    bool      `yaml:"debug"`
+	FFmpeg   string    `yaml:"ffmpeg"`
+}
+
+// Profile is a failover entry that overrides top-level runtime fields.
+type Profile struct {
+	Name   string `yaml:"name"`
 	Link   string `yaml:"link"`
 	Auth   Auth   `yaml:"auth"`
 	Room   Room   `yaml:"room"`
@@ -34,10 +62,12 @@ type File struct {
 	Video  Video  `yaml:"video"`
 	VP8    VP8    `yaml:"vp8"`
 	SEI    SEI    `yaml:"sei"`
-	Gen    Gen    `yaml:"gen"`
-	Data   string `yaml:"data"`
-	Debug  bool   `yaml:"debug"`
-	FFmpeg string `yaml:"ffmpeg"`
+}
+
+// Failover controls ordered profile failover.
+type Failover struct {
+	RetryDelay string `yaml:"retry_delay"`
+	MaxCycles  int    `yaml:"max_cycles"`
 }
 
 // Auth selects the auth provider.
@@ -52,7 +82,8 @@ type Room struct {
 
 // Crypto holds the shared secret used to authenticate and encrypt the tunnel.
 type Crypto struct {
-	Key string `yaml:"key"` // 64-char hex (32 bytes)
+	Key     string `yaml:"key"`      // 64-char hex (32 bytes)
+	KeyFile string `yaml:"key_file"` // path to a file containing crypto.key
 }
 
 // Net groups network and transport selection.
@@ -125,7 +156,61 @@ func Load(path string) (File, error) {
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return File{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	if err := loadExternalSecrets(path, &f); err != nil {
+		return File{}, err
+	}
 	return f, nil
+}
+
+func loadExternalSecrets(configPath string, f *File) error {
+	if f.Crypto.KeyFile == "" {
+		return loadProfileSecrets(configPath, f.Profiles)
+	}
+	if f.Crypto.Key != "" {
+		return ErrCryptoKeyConflict
+	}
+
+	key, err := readKeyFile(configPath, f.Crypto.KeyFile)
+	if err != nil {
+		return err
+	}
+	f.Crypto.Key = key
+	return loadProfileSecrets(configPath, f.Profiles)
+}
+
+func loadProfileSecrets(configPath string, profiles []Profile) error {
+	for i := range profiles {
+		if profiles[i].Crypto.KeyFile == "" {
+			continue
+		}
+		if profiles[i].Crypto.Key != "" {
+			return fmt.Errorf("profiles[%d]: %w", i, ErrCryptoKeyConflict)
+		}
+		key, err := readKeyFile(configPath, profiles[i].Crypto.KeyFile)
+		if err != nil {
+			return fmt.Errorf("profiles[%d]: %w", i, err)
+		}
+		profiles[i].Crypto.Key = key
+	}
+	return nil
+}
+
+func readKeyFile(configPath, keyFile string) (string, error) {
+	keyPath := keyFile
+	if !filepath.IsAbs(keyPath) {
+		keyPath = filepath.Join(filepath.Dir(configPath), keyPath)
+	}
+
+	// #nosec G304 -- key_file is an explicit path in the user's config file.
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		return "", fmt.Errorf("read crypto key file %s: %w", keyPath, err)
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", ErrCryptoKeyFileEmpty
+	}
+	return key, nil
 }
 
 // Apply merges f onto dst. CLI-set fields (non-zero values in dst) win;
@@ -167,6 +252,43 @@ func Apply(dst session.Config, f File) session.Config {
 	return dst
 }
 
+// ApplyProfile overlays a failover profile onto an already-applied base config.
+func ApplyProfile(base session.Config, p Profile) session.Config {
+	dst := base
+	dst.Link = overlayString(dst.Link, p.Link)
+	dst.Transport = overlayString(dst.Transport, p.Net.Transport)
+	dst.Auth = overlayString(dst.Auth, p.Auth.Provider)
+	dst.Engine = overlayString(dst.Engine, p.Engine.Name)
+	dst.URL = overlayString(dst.URL, p.Engine.URL)
+	dst.Token = overlayString(dst.Token, p.Engine.Token)
+	dst.RoomID = overlayString(dst.RoomID, p.Room.ID)
+	dst.KeyHex = overlayString(dst.KeyHex, p.Crypto.Key)
+	dst.SOCKSHost = overlayString(dst.SOCKSHost, p.SOCKS.Host)
+	dst.SOCKSPort = overlayInt(dst.SOCKSPort, p.SOCKS.Port)
+	dst.SOCKSUser = overlayString(dst.SOCKSUser, p.SOCKS.User)
+	dst.SOCKSPass = overlayString(dst.SOCKSPass, p.SOCKS.Pass)
+	dst.DNSServer = overlayString(dst.DNSServer, p.Net.DNS)
+	dst.SOCKSProxyAddr = overlayString(dst.SOCKSProxyAddr, p.SOCKS.ProxyAddr)
+	dst.SOCKSProxyPort = overlayInt(dst.SOCKSProxyPort, p.SOCKS.ProxyPort)
+	dst.VideoWidth = overlayInt(dst.VideoWidth, p.Video.Width)
+	dst.VideoHeight = overlayInt(dst.VideoHeight, p.Video.Height)
+	dst.VideoFPS = overlayInt(dst.VideoFPS, p.Video.FPS)
+	dst.VideoBitrate = overlayString(dst.VideoBitrate, p.Video.Bitrate)
+	dst.VideoHW = overlayString(dst.VideoHW, p.Video.HW)
+	dst.VideoQRSize = overlayInt(dst.VideoQRSize, p.Video.QRSize)
+	dst.VideoQRRecovery = overlayString(dst.VideoQRRecovery, p.Video.QRRecovery)
+	dst.VideoCodec = overlayString(dst.VideoCodec, p.Video.Codec)
+	dst.VideoTileModule = overlayInt(dst.VideoTileModule, p.Video.TileModule)
+	dst.VideoTileRS = overlayInt(dst.VideoTileRS, p.Video.TileRS)
+	dst.VP8FPS = overlayInt(dst.VP8FPS, p.VP8.FPS)
+	dst.VP8BatchSize = overlayInt(dst.VP8BatchSize, p.VP8.BatchSize)
+	dst.SEIFPS = overlayInt(dst.SEIFPS, p.SEI.FPS)
+	dst.SEIBatchSize = overlayInt(dst.SEIBatchSize, p.SEI.BatchSize)
+	dst.SEIFragmentSize = overlayInt(dst.SEIFragmentSize, p.SEI.FragmentSize)
+	dst.SEIAckTimeoutMS = overlayInt(dst.SEIAckTimeoutMS, p.SEI.AckTimeoutMS)
+	return dst
+}
+
 func pickString(cli, yamlVal string) string {
 	if cli != "" {
 		return cli
@@ -179,4 +301,18 @@ func pickInt(cli, yamlVal int) int {
 		return cli
 	}
 	return yamlVal
+}
+
+func overlayString(base, override string) string {
+	if override != "" {
+		return override
+	}
+	return base
+}
+
+func overlayInt(base, override int) int {
+	if override != 0 {
+		return override
+	}
+	return base
 }

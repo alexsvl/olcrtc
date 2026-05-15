@@ -1,0 +1,34 @@
+# olcrtc failover config example
+# Use the same profile order on both peers.
+
+mode: srv
+link: direct
+
+crypto:
+  key_file: "./olcrtc.key"
+
+net:
+  dns: "1.1.1.1:53"
+
+data: data
+
+profiles:
+  - name: wb-vp8
+    auth:
+      provider: wbstream
+    room:
+      id: "REPLACE_WITH_WB_ROOM_ID"
+    net:
+      transport: vp8channel
+
+  - name: jitsi-datachannel
+    auth:
+      provider: jitsi
+    room:
+      id: "https://meet.example.org/REPLACE_WITH_ROOM_NAME"
+    net:
+      transport: datachannel
+
+failover:
+  retry_delay: 2s
+  max_cycles: 0

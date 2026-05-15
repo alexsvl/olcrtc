@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"time"
 
@@ -37,18 +38,33 @@ const (
 	videoCodecTile   = "tile"
 )
 
+const (
+	defaultVideoWidth      = 1920
+	defaultVideoHeight     = 1080
+	defaultVideoFPS        = 30
+	defaultVideoBitrate    = "2M"
+	defaultVideoHW         = "none"
+	defaultVideoQRRecovery = "low"
+	defaultVP8FPS          = 25
+	defaultVP8BatchSize    = 1
+	defaultSEIFPS          = 60
+	defaultSEIBatchSize    = 64
+	defaultSEIFragmentSize = 900
+	defaultSEIAckTimeoutMS = 2000
+)
+
 var (
 	// ErrRoomIDRequired indicates that a room id is required for the selected carrier.
-	ErrRoomIDRequired = errors.New("room ID required (use -id <id>)")
+	ErrRoomIDRequired = errors.New("room ID required (set room.id)")
 	// ErrModeRequired indicates that mode is not one of the supported values.
-	ErrModeRequired = errors.New("mode required (use -mode srv, -mode cnc or -mode gen)")
-	// ErrAmountRequired indicates that -amount is required for gen mode.
-	ErrAmountRequired = errors.New("amount required for gen mode (use -amount <n>)")
+	ErrModeRequired = errors.New("mode required (set mode to srv, cnc or gen)")
+	// ErrAmountRequired indicates that gen.amount is required for gen mode.
+	ErrAmountRequired = errors.New("amount required for gen mode (set gen.amount)")
 	// ErrAuthRequired indicates that no auth provider was selected.
 	ErrAuthRequired = errors.New(
-		"auth provider required (use -auth jitsi, -auth telemost, -auth jazz, -auth wbstream or -auth none)")
-	// ErrURLRequired indicates that -url must be provided when the auth provider has no default URL.
-	ErrURLRequired = errors.New("SFU URL required (use -url wss://...)")
+		"auth provider required (set auth.provider to jitsi, telemost, jazz, wbstream or none)")
+	// ErrURLRequired indicates that auth.url must be provided when the auth provider has no default URL.
+	ErrURLRequired = errors.New("SFU URL required (set auth.url)")
 	// ErrUnsupportedCarrier indicates that carrier is not registered.
 	ErrUnsupportedCarrier = errors.New("unsupported carrier")
 	// ErrUnsupportedLink indicates that link is not registered.
@@ -57,51 +73,53 @@ var (
 	ErrUnsupportedTransport = errors.New("unsupported transport")
 
 	// ErrLinkRequired indicates that link is not provided.
-	ErrLinkRequired = errors.New("link required (use -link direct)")
+	ErrLinkRequired = errors.New("link required (set link to direct)")
 	// ErrTransportRequired indicates that transport is not provided.
 	ErrTransportRequired = errors.New(
-		"transport required (use -transport datachannel, -transport videochannel, " +
-			"-transport seichannel or -transport vp8channel)")
+		"transport required (set transport to datachannel, videochannel, seichannel or vp8channel)")
 	// ErrKeyRequired indicates that encryption key is not provided.
-	ErrKeyRequired = errors.New("key required (use -key <hex>)")
+	ErrKeyRequired = errors.New("key required (set crypto.key)")
 	// ErrDNSServerRequired indicates that dns server is not provided.
-	ErrDNSServerRequired = errors.New("dns server required (use -dns 1.1.1.1:53)")
+	ErrDNSServerRequired = errors.New("dns server required (set net.dns)")
 
 	// ErrVideoWidthRequired indicates that video width is required for videochannel.
-	ErrVideoWidthRequired = errors.New("video width required for videochannel (use -video-w)")
+	ErrVideoWidthRequired = errors.New("video width required for videochannel (set video.width)")
 	// ErrVideoHeightRequired indicates that video height is required for videochannel.
-	ErrVideoHeightRequired = errors.New("video height required for videochannel (use -video-h)")
+	ErrVideoHeightRequired = errors.New("video height required for videochannel (set video.height)")
 	// ErrVideoFPSRequired indicates that video fps is required for videochannel.
-	ErrVideoFPSRequired = errors.New("video fps required for videochannel (use -video-fps)")
+	ErrVideoFPSRequired = errors.New("video fps required for videochannel (set video.fps)")
 	// ErrVideoBitrateRequired indicates that video bitrate is required for videochannel.
 	ErrVideoBitrateRequired = errors.New(
-		"video bitrate required for videochannel (use -video-bitrate)")
+		"video bitrate required for videochannel (set video.bitrate)")
 	// ErrVideoHWRequired indicates that video hardware acceleration is required.
 	ErrVideoHWRequired = errors.New(
-		"video hardware acceleration required for videochannel (use -video-hw none/nvenc)")
+		"video hardware acceleration required for videochannel (set video.hw to none or nvenc)")
 	// ErrVideoCodecInvalid indicates that the video codec is not valid.
 	ErrVideoCodecInvalid = errors.New(
-		"invalid video codec for videochannel (use -video-codec qrcode or -video-codec tile)")
+		"invalid video codec for videochannel (set video.codec to qrcode or tile)")
 	// ErrTileCodecDimensions indicates that tile codec requires 1080x1080 dimensions.
-	ErrTileCodecDimensions = errors.New("tile codec requires -video-w 1080 -video-h 1080")
+	ErrTileCodecDimensions = errors.New("tile codec requires video.width: 1080 and video.height: 1080")
 
 	// ErrVP8FPSRequired indicates that vp8 fps is required for vp8channel.
-	ErrVP8FPSRequired = errors.New("vp8 fps required for vp8channel (use -vp8-fps)")
+	ErrVP8FPSRequired = errors.New("vp8 fps required for vp8channel (set vp8.fps)")
 	// ErrVP8BatchSizeRequired indicates that vp8 batch size is required for vp8channel.
-	ErrVP8BatchSizeRequired = errors.New("vp8 batch size required for vp8channel (use -vp8-batch)")
+	ErrVP8BatchSizeRequired = errors.New("vp8 batch size required for vp8channel (set vp8.batch_size)")
 	// ErrSEIFPSRequired indicates that seichannel fps is required.
-	ErrSEIFPSRequired = errors.New("fps required for seichannel (use -fps)")
+	ErrSEIFPSRequired = errors.New("fps required for seichannel (set sei.fps)")
 	// ErrSEIBatchSizeRequired indicates that seichannel batch size is required.
-	ErrSEIBatchSizeRequired = errors.New("batch size required for seichannel (use -batch)")
+	ErrSEIBatchSizeRequired = errors.New("batch size required for seichannel (set sei.batch_size)")
 	// ErrSEIFragmentSizeRequired indicates that seichannel fragment size is required.
-	ErrSEIFragmentSizeRequired = errors.New("fragment size required for seichannel (use -frag)")
+	ErrSEIFragmentSizeRequired = errors.New("fragment size required for seichannel (set sei.fragment_size)")
 	// ErrSEIAckTimeoutRequired indicates that seichannel ack timeout is required.
-	ErrSEIAckTimeoutRequired = errors.New("ack timeout required for seichannel (use -ack-ms)")
+	ErrSEIAckTimeoutRequired = errors.New("ack timeout required for seichannel (set sei.ack_timeout_ms)")
 
 	// ErrSOCKSHostRequired indicates that socks host is required for cnc mode.
-	ErrSOCKSHostRequired = errors.New("socks host required for cnc mode (use -socks-host)")
+	ErrSOCKSHostRequired = errors.New("socks host required for cnc mode (set socks.host)")
 	// ErrSOCKSPortRequired indicates that socks port is required for cnc mode.
-	ErrSOCKSPortRequired = errors.New("socks port required for cnc mode (use -socks-port)")
+	ErrSOCKSPortRequired = errors.New("socks port required for cnc mode (set socks.port)")
+	// ErrSOCKSAuthRequired indicates that a non-loopback SOCKS listener requires authentication.
+	ErrSOCKSAuthRequired = errors.New(
+		"socks auth required when binding outside loopback (set socks.user and socks.pass)")
 )
 
 // Config holds runtime session settings.
@@ -178,6 +196,80 @@ func ApplyAuthDefaults(cfg Config) (Config, error) {
 		return cfg, fmt.Errorf("%w: auth provider %q has no default URL", ErrURLRequired, cfg.Auth)
 	}
 	return cfg, nil
+}
+
+// ApplyTransportDefaults fills documented transport defaults without changing core routing fields.
+func ApplyTransportDefaults(cfg Config) Config {
+	switch cfg.Transport {
+	case transportVideo:
+		return applyVideoDefaults(cfg)
+	case transportVP8:
+		return applyVP8Defaults(cfg)
+	case transportSEI:
+		return applySEIDefaults(cfg)
+	default:
+		return cfg
+	}
+}
+
+func applyVideoDefaults(cfg Config) Config {
+	if cfg.VideoCodec == "" {
+		cfg.VideoCodec = videoCodecQRCode
+	}
+	if cfg.VideoCodec == videoCodecTile {
+		if cfg.VideoWidth == 0 {
+			cfg.VideoWidth = 1080
+		}
+		if cfg.VideoHeight == 0 {
+			cfg.VideoHeight = 1080
+		}
+	} else {
+		if cfg.VideoWidth == 0 {
+			cfg.VideoWidth = defaultVideoWidth
+		}
+		if cfg.VideoHeight == 0 {
+			cfg.VideoHeight = defaultVideoHeight
+		}
+	}
+	if cfg.VideoFPS == 0 {
+		cfg.VideoFPS = defaultVideoFPS
+	}
+	if cfg.VideoBitrate == "" {
+		cfg.VideoBitrate = defaultVideoBitrate
+	}
+	if cfg.VideoHW == "" {
+		cfg.VideoHW = defaultVideoHW
+	}
+	if cfg.VideoQRRecovery == "" {
+		cfg.VideoQRRecovery = defaultVideoQRRecovery
+	}
+	return cfg
+}
+
+func applyVP8Defaults(cfg Config) Config {
+	if cfg.VP8FPS == 0 {
+		cfg.VP8FPS = defaultVP8FPS
+	}
+	if cfg.VP8BatchSize == 0 {
+		cfg.VP8BatchSize = defaultVP8BatchSize
+	}
+	return cfg
+}
+
+func applySEIDefaults(cfg Config) Config {
+	if cfg.SEIFPS == 0 {
+		cfg.SEIFPS = defaultSEIFPS
+	}
+	if cfg.SEIBatchSize == 0 {
+		cfg.SEIBatchSize = defaultSEIBatchSize
+	}
+	if cfg.SEIFragmentSize == 0 {
+		cfg.SEIFragmentSize = defaultSEIFragmentSize
+	}
+	if cfg.SEIAckTimeoutMS == 0 {
+		cfg.SEIAckTimeoutMS = defaultSEIAckTimeoutMS
+	}
+	return cfg
 }
 
 // Validate verifies that the runtime config refers to registered components and all required fields are present.
@@ -333,11 +425,23 @@ func validateModeConfig(cfg Config) error {
 	if cfg.SOCKSPort == 0 {
 		return ErrSOCKSPortRequired
 	}
+	if !isLoopbackListenHost(cfg.SOCKSHost) && (cfg.SOCKSUser == "" || cfg.SOCKSPass == "") {
+		return ErrSOCKSAuthRequired
+	}
 	return nil
+}
+
+func isLoopbackListenHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Run starts the configured mode.
 func Run(ctx context.Context, cfg Config) error {
+	cfg = ApplyTransportDefaults(cfg)
 	roomURL := cfg.RoomID
 
 	switch cfg.Mode {

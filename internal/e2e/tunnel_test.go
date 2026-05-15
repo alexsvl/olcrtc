@@ -24,6 +24,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/client"
 	"github.com/openlibrecommunity/olcrtc/internal/link"
 	"github.com/openlibrecommunity/olcrtc/internal/server"
+	"github.com/openlibrecommunity/olcrtc/internal/supervisor"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -47,6 +48,7 @@ var (
 	errSocksUnexpectedReply  = errors.New("unexpected SOCKS5 reply")
 	errSocksUnexpectedHello  = errors.New("unexpected SOCKS5 greeting")
 	errPayloadMismatchOffset = errors.New("payload mismatch at offset")
+	errFailoverCarrier       = errors.New("intentional failover carrier failure")
 )
 
 var (
@@ -345,6 +347,17 @@ func registerMemoryCarrierAs(t *testing.T, name string) {
 		room.mu.Unlock()
 		return &memorySession{stream: stream}, nil
 	})
+}
+
+func registerFailingCarrier(t *testing.T) string {
+	t.Helper()
+	session.RegisterDefaults()
+
+	name := "e2e-fail-" + t.Name()
+	carrier.Register(name, func(context.Context, carrier.Config) (carrier.Session, error) {
+		return nil, errFailoverCarrier
+	})
+	return name
 }
 
 func builtInCarrierNames() []string {
@@ -1160,6 +1173,186 @@ func TestFrequentReconnectsStillAllowNewSOCKSConnections(t *testing.T) {
 		if !bytes.Equal(line, payload) {
 			t.Fatalf("echo after reconnect %d = %q, want %q", i, line, payload)
 		}
+	}
+}
+
+func TestSupervisorFailoverProfilesReachWorkingSOCKS(t *testing.T) {
+	echoAddr := startEchoServer(t)
+	failingCarrier := registerFailingCarrier(t)
+	memoryCarrier, room := registerMemoryCarrier(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	socksAddr := freeLocalAddr(ctx, t)
+	socksHost, socksPort := splitHostPort(t, socksAddr)
+
+	serverProfiles := []supervisor.Profile{
+		{Name: "failing-server", Config: failoverSessionConfig("srv", failingCarrier, "", 0)},
+		{Name: "memory-server", Config: failoverSessionConfig("srv", memoryCarrier, "", 0)},
+	}
+	clientProfiles := []supervisor.Profile{
+		{Name: "failing-client", Config: failoverSessionConfig("cnc", failingCarrier, socksHost, socksPort)},
+		{Name: "memory-client", Config: failoverSessionConfig("cnc", memoryCarrier, socksHost, socksPort)},
+	}
+
+	started := make(chan string, 8)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- supervisor.Run(ctx, failoverE2EConfig(serverProfiles, started, "server"), session.Run)
+	}()
+	room.waitConnected(t, 1)
+
+	ready := make(chan struct{})
+	var readyOnce sync.Once
+	clientErr := make(chan error, 1)
+	go func() {
+		clientErr <- supervisor.Run(ctx, failoverE2EConfig(clientProfiles, started, "client"), func(ctx context.Context, cfg session.Config) error {
+			return client.RunWithReady(ctx, clientConfigFromSession(cfg, socksAddr), func() {
+				if cfg.Auth == memoryCarrier {
+					readyOnce.Do(func() { close(ready) })
+				}
+			})
+		})
+	}()
+
+	waitForReady(t, ready)
+	conn := eventuallyConnectViaSOCKS(t, socksAddr, echoAddr)
+	defer func() { _ = conn.Close() }()
+
+	payload := []byte("olcrtc-failover-e2e\n")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write failover payload: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set failover read deadline: %v", err)
+	}
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read failover echo: %v", err)
+	}
+	if !bytes.Equal(line, payload) {
+		t.Fatalf("failover echo = %q, want %q", line, payload)
+	}
+
+	requireStartedProfiles(t, started, []string{
+		"server:failing-server",
+		"server:memory-server",
+		"client:failing-client",
+		"client:memory-client",
+	})
+
+	cancel()
+	waitSupervisorStopped(t, "client", clientErr)
+	waitSupervisorStopped(t, "server", serverErr)
+}
+
+func failoverSessionConfig(mode, carrierName, socksHost string, socksPort int) session.Config {
+	cfg := session.Config{
+		Mode:      mode,
+		Link:      linkDirect,
+		Transport: transportData,
+		Auth:      carrierName,
+		RoomID:    testRoom,
+		KeyHex:    testKeyHex,
+		DNSServer: localDNSServer,
+	}
+	if mode == "cnc" {
+		cfg.SOCKSHost = socksHost
+		cfg.SOCKSPort = socksPort
+	}
+	return cfg
+}
+
+func clientConfigFromSession(cfg session.Config, socksAddr string) client.Config {
+	return client.Config{
+		Link:            cfg.Link,
+		Transport:       cfg.Transport,
+		Carrier:         cfg.Auth,
+		RoomURL:         cfg.RoomID,
+		KeyHex:          cfg.KeyHex,
+		LocalAddr:       socksAddr,
+		DNSServer:       cfg.DNSServer,
+		DeviceID:        testClientDeviceID,
+		VideoWidth:      cfg.VideoWidth,
+		VideoHeight:     cfg.VideoHeight,
+		VideoFPS:        cfg.VideoFPS,
+		VideoBitrate:    cfg.VideoBitrate,
+		VideoHW:         cfg.VideoHW,
+		VideoQRSize:     cfg.VideoQRSize,
+		VideoQRRecovery: cfg.VideoQRRecovery,
+		VideoCodec:      cfg.VideoCodec,
+		VideoTileModule: cfg.VideoTileModule,
+		VideoTileRS:     cfg.VideoTileRS,
+		VP8FPS:          cfg.VP8FPS,
+		VP8BatchSize:    cfg.VP8BatchSize,
+		SEIFPS:          cfg.SEIFPS,
+		SEIBatchSize:    cfg.SEIBatchSize,
+		SEIFragmentSize: cfg.SEIFragmentSize,
+		SEIAckTimeoutMS: cfg.SEIAckTimeoutMS,
+		Engine:          cfg.Engine,
+		URL:             cfg.URL,
+		Token:           cfg.Token,
+	}
+}
+
+func failoverE2EConfig(
+	profiles []supervisor.Profile,
+	started chan<- string,
+	side string,
+) supervisor.Config {
+	return supervisor.Config{
+		Profiles:   profiles,
+		RetryDelay: time.Millisecond,
+		OnProfileStart: func(profile supervisor.Profile, _ int) {
+			select {
+			case started <- side + ":" + profile.Name:
+			default:
+			}
+		},
+	}
+}
+
+func splitHostPort(t *testing.T, addr string) (string, int) {
+	t.Helper()
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("split host port %q: %v", addr, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatalf("parse port %q: %v", portText, err)
+	}
+	return host, port
+}
+
+func requireStartedProfiles(t *testing.T, started <-chan string, want []string) {
+	t.Helper()
+	seen := make(map[string]bool)
+	deadline := time.After(3 * time.Second)
+	for len(seen) < len(want) {
+		select {
+		case item := <-started:
+			seen[item] = true
+		case <-deadline:
+			t.Fatalf("started profiles = %v, want all %v", seen, want)
+		}
+	}
+	for _, item := range want {
+		if !seen[item] {
+			t.Fatalf("started profiles = %v, missing %s", seen, item)
+		}
+	}
+}
+
+func waitSupervisorStopped(t *testing.T, name string, ch <-chan error) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Fatalf("%s supervisor returned error: %v", name, err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s supervisor did not stop", name)
 	}
 }
 

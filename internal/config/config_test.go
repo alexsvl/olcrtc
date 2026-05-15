@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -118,6 +119,157 @@ func TestApplyCLIWins(t *testing.T) {
 	}
 	if got.SOCKSHost != "0.0.0.0" {
 		t.Errorf("SOCKSHost: got %q, want 0.0.0.0 (YAML fills empty CLI)", got.SOCKSHost)
+	}
+}
+
+func TestLoadAndApplyProfile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "olcrtc.yaml")
+	body := `
+mode: srv
+link: direct
+crypto:
+  key: shared-key
+net:
+  dns: 1.1.1.1:53
+profiles:
+  - name: wb-vp8
+    auth:
+      provider: wbstream
+    room:
+      id: wb-room
+    net:
+      transport: vp8channel
+    vp8:
+      fps: 30
+  - name: jitsi-dc
+    auth:
+      provider: jitsi
+    room:
+      id: https://meet.example/room
+    net:
+      transport: datachannel
+      dns: 8.8.8.8:53
+failover:
+  retry_delay: 100ms
+  max_cycles: 2
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(f.Profiles) != 2 {
+		t.Fatalf("profiles = %d, want 2", len(f.Profiles))
+	}
+	if f.Failover.RetryDelay != "100ms" || f.Failover.MaxCycles != 2 {
+		t.Fatalf("Failover = %+v, want retry_delay 100ms max_cycles 2", f.Failover)
+	}
+
+	base := Apply(session.Config{}, f)
+	first := ApplyProfile(base, f.Profiles[0])
+	if first.Auth != "wbstream" || first.Transport != "vp8channel" || first.RoomID != "wb-room" {
+		t.Fatalf("first profile = %+v", first)
+	}
+	if first.KeyHex != "shared-key" || first.DNSServer != "1.1.1.1:53" || first.VP8FPS != 30 {
+		t.Fatalf("first inherited/overlaid fields = %+v", first)
+	}
+	second := ApplyProfile(base, f.Profiles[1])
+	if second.Auth != "jitsi" || second.Transport != "datachannel" ||
+		second.RoomID != "https://meet.example/room" || second.DNSServer != "8.8.8.8:53" {
+		t.Fatalf("second profile = %+v", second)
+	}
+}
+
+func TestLoadProfileCryptoKeyFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "profile.key"), []byte(testCryptoKey+"\n"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	path := filepath.Join(dir, "olcrtc.yaml")
+	body := `
+profiles:
+  - name: file-key
+    crypto:
+      key_file: profile.key
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := f.Profiles[0].Crypto.Key; got != testCryptoKey {
+		t.Fatalf("profile key = %q, want %q", got, testCryptoKey)
+	}
+}
+
+func TestLoadCryptoKeyFileRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "secret.key")
+	if err := os.WriteFile(keyPath, []byte(testCryptoKey+"\n"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	path := filepath.Join(dir, "olcrtc.yaml")
+	body := `
+mode: srv
+crypto:
+  key_file: secret.key
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.Crypto.Key != testCryptoKey {
+		t.Fatalf("Crypto.Key = %q, want %q", f.Crypto.Key, testCryptoKey)
+	}
+}
+
+func TestLoadCryptoKeyFileConflict(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "olcrtc.yaml")
+	body := `
+crypto:
+  key: deadbeef
+  key_file: secret.key
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := Load(path)
+	if !errors.Is(err, ErrCryptoKeyConflict) {
+		t.Fatalf("Load() error = %v, want %v", err, ErrCryptoKeyConflict)
+	}
+}
+
+func TestLoadCryptoKeyFileEmpty(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "secret.key")
+	if err := os.WriteFile(keyPath, []byte("\n"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	path := filepath.Join(dir, "olcrtc.yaml")
+	body := `
+crypto:
+  key_file: secret.key
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, err := Load(path)
+	if !errors.Is(err, ErrCryptoKeyFileEmpty) {
+		t.Fatalf("Load() error = %v, want %v", err, ErrCryptoKeyFileEmpty)
 	}
 }
 

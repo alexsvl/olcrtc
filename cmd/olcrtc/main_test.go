@@ -9,6 +9,7 @@ import (
 
 	"github.com/openlibrecommunity/olcrtc/internal/app/session"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
+	"github.com/openlibrecommunity/olcrtc/internal/supervisor"
 )
 
 var errBoom = errors.New("boom")
@@ -149,6 +150,112 @@ data: `+dir+`
 	}
 }
 
+func TestRunWithArgsAppliesTransportDefaults(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "names"), []byte("A\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(names) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "surnames"), []byte("B\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(surnames) error = %v", err)
+	}
+
+	oldRunSession := runSession
+	t.Cleanup(func() { runSession = oldRunSession })
+	runSession = func(ctx context.Context, cfg session.Config) error {
+		if cfg.VP8FPS != 25 || cfg.VP8BatchSize != 1 {
+			t.Fatalf("VP8 defaults = fps %d batch %d, want 25/1", cfg.VP8FPS, cfg.VP8BatchSize)
+		}
+		return nil
+	}
+
+	yamlPath := writeYAML(t, `
+mode: srv
+link: direct
+auth:
+  provider: wbstream
+room:
+  id: room
+crypto:
+  key: key
+net:
+  transport: vp8channel
+  dns: 1.1.1.1:53
+data: `+dir+`
+`)
+
+	if err := runWithArgs([]string{yamlPath}); err != nil {
+		t.Fatalf("runWithArgs() error = %v", err)
+	}
+}
+
+func TestRunWithArgsFailoverProfiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "names"), []byte("A\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(names) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "surnames"), []byte("B\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(surnames) error = %v", err)
+	}
+
+	oldRunSession := runSession
+	t.Cleanup(func() { runSession = oldRunSession })
+	var seen []string
+	runSession = func(ctx context.Context, cfg session.Config) error {
+		seen = append(seen, cfg.Auth+"/"+cfg.Transport)
+		if cfg.Auth == "wbstream" && (cfg.VP8FPS != 25 || cfg.VP8BatchSize != 1) {
+			t.Fatalf("VP8 defaults = fps %d batch %d, want 25/1", cfg.VP8FPS, cfg.VP8BatchSize)
+		}
+		return errBoom
+	}
+
+	yamlPath := writeYAML(t, `
+mode: srv
+link: direct
+crypto:
+  key: key
+net:
+  dns: 1.1.1.1:53
+profiles:
+  - name: wb-primary
+    auth:
+      provider: wbstream
+    room:
+      id: room
+    net:
+      transport: vp8channel
+  - name: jitsi-backup
+    auth:
+      provider: jitsi
+    room:
+      id: https://meet.example/room
+    net:
+      transport: datachannel
+failover:
+  retry_delay: -1ns
+  max_cycles: 1
+data: `+dir+`
+`)
+
+	err := runWithArgs([]string{yamlPath})
+	if !errors.Is(err, supervisor.ErrMaxCyclesExceeded) {
+		t.Fatalf("runWithArgs() error = %v, want %v", err, supervisor.ErrMaxCyclesExceeded)
+	}
+	want := []string{"wbstream/vp8channel", "jitsi/datachannel"}
+	if !equalStrings(seen, want) {
+		t.Fatalf("seen profiles = %v, want %v", seen, want)
+	}
+}
+
+func TestRunWithConfigRejectsProfilesInGenMode(t *testing.T) {
+	cfg := loadedConfig{
+		scfg:     session.Config{Mode: modeGen},
+		profiles: []supervisor.Profile{{Name: "one"}},
+	}
+	if err := runWithConfig(cfg); !errors.Is(err, ErrProfilesUnsupportedForGen) {
+		t.Fatalf("runWithConfig() error = %v, want %v", err, ErrProfilesUnsupportedForGen)
+	}
+}
+
 func TestConfigureLogging(t *testing.T) {
 	t.Setenv("PION_LOG_DISABLE", "")
 	logger.SetVerbose(false)
@@ -168,6 +275,18 @@ func TestConfigureLogging(t *testing.T) {
 	if got := os.Getenv("PION_LOG_DISABLE"); got != "all" {
 		t.Fatalf("configureLogging(false) PION_LOG_DISABLE = %q, want all", got)
 	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestResolveDataDir(t *testing.T) {

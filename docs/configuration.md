@@ -11,6 +11,7 @@ olcrtc /etc/olcrtc/server.yaml
 
 - [`server.example.yaml`](./server.example.yaml)
 - [`client.example.yaml`](./client.example.yaml)
+- [`failover.example.yaml`](./failover.example.yaml)
 
 ## Схема  
 
@@ -20,7 +21,7 @@ olcrtc /etc/olcrtc/server.yaml
 | `link`                                                           | `direct`                                                  |
 | `auth.provider`                                                  | `jitsi`, `telemost`, `jazz`, `wbstream`, `none`           |
 | `room.id`                                                        | conference room id                                        |
-| `crypto.key`                                                     | 64-char hex (32 bytes)                                    |
+| `crypto.key` / `crypto.key_file`                                 | 64-char hex (32 bytes), inline or read from file          |
 | `net.transport`                                                  | `datachannel`, `videochannel`, `seichannel`, `vp8channel` |
 | `net.dns`                                                        | resolver `host:port`                                      |
 | `socks.host` / `.port`                                           | client-side listener                                      |
@@ -31,6 +32,57 @@ olcrtc /etc/olcrtc/server.yaml
 | `vp8.*`                                                          | vp8channel tuning                                         |
 | `sei.fps` / `.batch_size` / `.fragment_size` / `.ack_timeout_ms` | seichannel tuning                                         |
 | `gen.amount`                                                     | gen mode: number of rooms to create                       |
+| `profiles[]`                                                     | ordered srv/cnc failover profiles                         |
+| `failover.retry_delay`                                           | delay before trying the next profile, e.g. `2s`           |
+| `failover.max_cycles`                                            | stop after N full profile-list passes; `0` = forever      |
 | `data`                                                           | path to data directory                                    |
 | `debug`                                                          | verbose logging                                           |
 | `ffmpeg`                                                         | path to ffmpeg binary                                     |
+
+`mode: cnc` refuses non-loopback `socks.host` values unless both
+`socks.user` and `socks.pass` are set.
+
+`crypto.key_file` is resolved relative to the YAML file. Do not set it
+together with `crypto.key`.
+
+## Failover Profiles
+
+`mode: srv` and `mode: cnc` can define `profiles`. Top-level fields are used
+as common defaults; each profile overrides only the fields it sets. The CLI
+runs profiles in order. If a profile fails or ends while the process is still
+alive, olcrtc waits `failover.retry_delay` and starts the next profile.
+
+```yaml
+mode: srv
+link: direct
+crypto:
+  key_file: ./olcrtc.key
+net:
+  dns: "1.1.1.1:53"
+data: data
+
+profiles:
+  - name: wb-vp8
+    auth:
+      provider: wbstream
+    room:
+      id: "WB_ROOM_ID"
+    net:
+      transport: vp8channel
+
+  - name: jitsi-dc
+    auth:
+      provider: jitsi
+    room:
+      id: "https://meet.example.org/olcrtc-room"
+    net:
+      transport: datachannel
+
+failover:
+  retry_delay: 2s
+  max_cycles: 0
+```
+
+Both peers must use compatible profile order and room settings. This first
+failover layer rebuilds the session on the next profile; active smux streams
+do not migrate, but new connections can recover on the next profile.

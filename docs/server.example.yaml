@@ -16,6 +16,7 @@ room:
 
 crypto:
   # 32-byte hex (64 chars). Generate with: openssl rand -hex 32
+  # Or use key_file: "./olcrtc.key" to keep the secret out of this file.
   key: "REPLACE_ME_WITH_64_HEX_CHARS"
 
 net:

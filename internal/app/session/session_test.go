@@ -6,6 +6,85 @@ import (
 	"testing"
 )
 
+func TestApplyTransportDefaults(t *testing.T) {
+	tests := []struct {
+		name string
+		in   Config
+		want Config
+	}{
+		{
+			name: "vp8",
+			in:   Config{Transport: transportVP8},
+			want: Config{Transport: transportVP8, VP8FPS: 25, VP8BatchSize: 1},
+		},
+		{
+			name: "sei",
+			in:   Config{Transport: transportSEI},
+			want: Config{
+				Transport:       transportSEI,
+				SEIFPS:          60,
+				SEIBatchSize:    64,
+				SEIFragmentSize: 900,
+				SEIAckTimeoutMS: 2000,
+			},
+		},
+		{
+			name: "video qrcode",
+			in:   Config{Transport: transportVideo},
+			want: Config{
+				Transport:       transportVideo,
+				VideoWidth:      1920,
+				VideoHeight:     1080,
+				VideoFPS:        30,
+				VideoBitrate:    "2M",
+				VideoHW:         "none",
+				VideoQRRecovery: "low",
+				VideoCodec:      videoCodecQRCode,
+			},
+		},
+		{
+			name: "video tile dimensions",
+			in:   Config{Transport: transportVideo, VideoCodec: videoCodecTile},
+			want: Config{
+				Transport:       transportVideo,
+				VideoWidth:      1080,
+				VideoHeight:     1080,
+				VideoFPS:        30,
+				VideoBitrate:    "2M",
+				VideoHW:         "none",
+				VideoQRRecovery: "low",
+				VideoCodec:      videoCodecTile,
+			},
+		},
+		{
+			name: "keeps explicit values",
+			in: Config{
+				Transport:       transportSEI,
+				SEIFPS:          10,
+				SEIBatchSize:    2,
+				SEIFragmentSize: 300,
+				SEIAckTimeoutMS: 1500,
+			},
+			want: Config{
+				Transport:       transportSEI,
+				SEIFPS:          10,
+				SEIBatchSize:    2,
+				SEIFragmentSize: 300,
+				SEIAckTimeoutMS: 1500,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ApplyTransportDefaults(tt.in)
+			if got != tt.want {
+				t.Fatalf("ApplyTransportDefaults() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 //nolint:maintidx // table-driven validation test naturally has many cases
 func TestValidate(t *testing.T) {
 	RegisterDefaults()
@@ -309,6 +388,39 @@ func TestValidate(t *testing.T) {
 				return cfg
 			}(),
 			want: ErrSOCKSPortRequired,
+		},
+		{
+			name: "cnc rejects unauthenticated wildcard socks bind",
+			cfg: func() Config {
+				cfg := base
+				cfg.Mode = modeCNC
+				cfg.SOCKSHost = "0.0.0.0"
+				cfg.SOCKSPort = 1080
+				return cfg
+			}(),
+			want: ErrSOCKSAuthRequired,
+		},
+		{
+			name: "cnc allows authenticated wildcard socks bind",
+			cfg: func() Config {
+				cfg := base
+				cfg.Mode = modeCNC
+				cfg.SOCKSHost = "0.0.0.0"
+				cfg.SOCKSPort = 1080
+				cfg.SOCKSUser = "user"
+				cfg.SOCKSPass = "pass"
+				return cfg
+			}(),
+		},
+		{
+			name: "cnc allows localhost socks bind without auth",
+			cfg: func() Config {
+				cfg := base
+				cfg.Mode = modeCNC
+				cfg.SOCKSHost = "localhost"
+				cfg.SOCKSPort = 1080
+				return cfg
+			}(),
 		},
 	}
 

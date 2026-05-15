@@ -24,6 +24,7 @@ import (
 	configpkg "github.com/openlibrecommunity/olcrtc/internal/config"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
+	"github.com/openlibrecommunity/olcrtc/internal/supervisor"
 	"github.com/openlibrecommunity/olcrtc/internal/transport/videochannel"
 )
 
@@ -35,6 +36,9 @@ var ErrConfigPathRequired = errors.New("usage: olcrtc <config.yaml>")
 // ErrDataDirRequired is returned when the YAML config does not specify a data directory.
 var ErrDataDirRequired = errors.New("data directory required (set 'data:' in YAML)")
 
+// ErrProfilesUnsupportedForGen is returned when failover profiles are configured for gen mode.
+var ErrProfilesUnsupportedForGen = errors.New("profiles are only supported for srv and cnc modes")
+
 //nolint:gochecknoglobals // Tests replace the long-running session runner with a bounded function.
 var runSession = session.Run
 
@@ -44,9 +48,16 @@ var runGen = execGen
 // loadedConfig bundles the parsed YAML file and the derived session config.
 type loadedConfig struct {
 	scfg       session.Config
+	profiles   []supervisor.Profile
+	failover   failoverConfig
 	dataDir    string
 	debug      bool
 	ffmpegPath string
+}
+
+type failoverConfig struct {
+	retryDelay time.Duration
+	maxCycles  int
 }
 
 func main() {
@@ -79,12 +90,42 @@ func loadConfig(path string) (loadedConfig, error) {
 	if err != nil {
 		return loadedConfig{}, fmt.Errorf("load config: %w", err)
 	}
+	base := configpkg.Apply(session.Config{}, f)
+	profiles := make([]supervisor.Profile, 0, len(f.Profiles))
+	for i, profile := range f.Profiles {
+		name := profile.Name
+		if name == "" {
+			name = fmt.Sprintf("profile-%d", i+1)
+		}
+		profiles = append(profiles, supervisor.Profile{
+			Name:   name,
+			Config: configpkg.ApplyProfile(base, profile),
+		})
+	}
+	failover, err := parseFailoverConfig(f.Failover)
+	if err != nil {
+		return loadedConfig{}, err
+	}
 	return loadedConfig{
-		scfg:       configpkg.Apply(session.Config{}, f),
+		scfg:       base,
+		profiles:   profiles,
+		failover:   failover,
 		dataDir:    f.Data,
 		debug:      f.Debug,
 		ffmpegPath: f.FFmpeg,
 	}, nil
+}
+
+func parseFailoverConfig(f configpkg.Failover) (failoverConfig, error) {
+	retryDelay := supervisor.DefaultRetryDelay
+	if f.RetryDelay != "" {
+		parsed, err := time.ParseDuration(f.RetryDelay)
+		if err != nil {
+			return failoverConfig{}, fmt.Errorf("parse failover.retry_delay: %w", err)
+		}
+		retryDelay = parsed
+	}
+	return failoverConfig{retryDelay: retryDelay, maxCycles: f.MaxCycles}, nil
 }
 
 func runWithConfig(cfg loadedConfig) error {
@@ -98,12 +139,37 @@ func runWithConfig(cfg loadedConfig) error {
 	if err != nil {
 		return fmt.Errorf("validate config: %w", err)
 	}
+	scfg = session.ApplyTransportDefaults(scfg)
 
 	if scfg.Mode == modeGen {
+		if len(cfg.profiles) > 0 {
+			return ErrProfilesUnsupportedForGen
+		}
 		return runGen(scfg)
 	}
 
+	if len(cfg.profiles) > 0 {
+		profiles, err := prepareProfiles(cfg.profiles)
+		if err != nil {
+			return err
+		}
+		return runFailoverSessionMode(cfg.dataDir, profiles, cfg.failover)
+	}
+
 	return runSessionMode(cfg.dataDir, scfg)
+}
+
+func prepareProfiles(profiles []supervisor.Profile) ([]supervisor.Profile, error) {
+	out := make([]supervisor.Profile, 0, len(profiles))
+	for _, profile := range profiles {
+		scfg, err := session.ApplyAuthDefaults(profile.Config)
+		if err != nil {
+			return nil, fmt.Errorf("validate profile %q: %w", profile.Name, err)
+		}
+		profile.Config = session.ApplyTransportDefaults(scfg)
+		out = append(out, profile)
+	}
+	return out, nil
 }
 
 func runSessionMode(dataDir string, scfg session.Config) error {
@@ -111,6 +177,47 @@ func runSessionMode(dataDir string, scfg session.Config) error {
 		return fmt.Errorf("validate config: %w", err)
 	}
 
+	if err := prepareRuntimeData(dataDir); err != nil {
+		return err
+	}
+
+	return runManaged(func(ctx context.Context) error {
+		return runSession(ctx, scfg)
+	})
+}
+
+func runFailoverSessionMode(dataDir string, profiles []supervisor.Profile, failover failoverConfig) error {
+	for _, profile := range profiles {
+		if err := session.Validate(profile.Config); err != nil {
+			return fmt.Errorf("validate profile %q: %w", profile.Name, err)
+		}
+	}
+
+	if err := prepareRuntimeData(dataDir); err != nil {
+		return err
+	}
+
+	return runManaged(func(ctx context.Context) error {
+		return supervisor.Run(ctx, supervisor.Config{
+			Profiles:   profiles,
+			RetryDelay: failover.retryDelay,
+			MaxCycles:  failover.maxCycles,
+			OnProfileStart: func(profile supervisor.Profile, cycle int) {
+				logger.Infof("failover cycle=%d starting profile=%s carrier=%s transport=%s",
+					cycle, profile.Name, profile.Config.Auth, profile.Config.Transport)
+			},
+			OnProfileEnd: func(profile supervisor.Profile, cycle int, err error) {
+				if err != nil {
+					logger.Warnf("failover cycle=%d profile=%s ended with error: %v", cycle, profile.Name, err)
+					return
+				}
+				logger.Warnf("failover cycle=%d profile=%s ended", cycle, profile.Name)
+			},
+		}, runSession)
+	})
+}
+
+func prepareRuntimeData(dataDir string) error {
 	if dataDir == "" {
 		return ErrDataDirRequired
 	}
@@ -124,6 +231,10 @@ func runSessionMode(dataDir string, scfg session.Config) error {
 		return err
 	}
 
+	return nil
+}
+
+func runManaged(run func(context.Context) error) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -132,7 +243,7 @@ func runSessionMode(dataDir string, scfg session.Config) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runSession(ctx, scfg)
+		errCh <- run(ctx)
 	}()
 
 	select {

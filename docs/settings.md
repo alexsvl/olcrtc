@@ -48,7 +48,7 @@
 | `auth.provider` | `telemost`, `jazz`, `wbstream` или `jitsi` |
 | `net.transport` | `datachannel`, `vp8channel`, `seichannel` или `videochannel` |
 | `room.id` | Room ID |
-| `crypto.key` | Ключ шифрования hex 64 символа. Генерация: `openssl rand -hex 32` |
+| `crypto.key` или `crypto.key_file` | Ключ шифрования hex 64 символа. Генерация: `openssl rand -hex 32` |
 | `link` | Всегда `direct` |
 | `data` | Всегда `data` |
 | `net.dns` | DNS-сервер, например `1.1.1.1:53` |
@@ -60,18 +60,27 @@
 | YAML поле | Описание |
 |-----------|----------|
 | `debug` | `true` для подробных логов соединений |
+| `profiles` | Список профилей failover для `srv`/`cnc` |
+| `failover.retry_delay` | Пауза перед следующим профилем, например `2s` |
+| `failover.max_cycles` | Сколько полных проходов по профилям сделать; `0` = бесконечно |
+
+`crypto.key_file` читается относительно YAML-файла. Не указывай `crypto.key` и `crypto.key_file` одновременно.
+
+Если задан `profiles`, поля верхнего уровня становятся общими defaults, а
+каждый профиль переопределяет только свои `auth`, `room`, `net`, `engine` и
+настройки транспорта. Порядок профилей должен совпадать на сервере и клиенте.
 
 ---
 
 ## mode: gen
 
-Генерирует Room ID заранее, не запуская сервер. Поддерживается только для `jazz`. Для `wbstream` создавай руму вручную через [stream.wb.ru](https://stream.wb.ru) (автогенерация отключена со стороны WB).
+Генерирует Room ID заранее, не запуская сервер. Поддерживается для auth-провайдеров с автосозданием комнат: `jazz` и `wbstream`. Для `telemost` комнату нужно создавать вручную через сайт.
 
 **Обязательные поля:**
 
 | YAML поле | Описание |
 |-----------|----------|
-| `auth.provider` | `jazz` |
+| `auth.provider` | `jazz` или `wbstream` |
 | `net.dns` | DNS-сервер |
 | `gen.amount` | Количество комнат |
 
@@ -79,7 +88,7 @@
 # gen.yaml
 mode: gen
 auth:
-  provider: jazz
+  provider: wbstream
 net:
   dns: "1.1.1.1:53"
 gen:
@@ -115,6 +124,9 @@ gen:
 
 Если `socks.user` не задан - аутентификация отключена (любой локальный клиент может подключиться).  
 Если задан - клиент принимает только подключения с правильным логином и паролем (RFC 1929).
+
+Если `socks.host` не loopback (`127.0.0.1`, `::1`, `localhost`), `socks.user` и `socks.pass` обязательны.
+Это защита от случайного открытого SOCKS5-прокси в локальной сети или интернете.
 
 ---
 
