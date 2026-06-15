@@ -1,6 +1,6 @@
 name: nightly-sync-build
 # Daily: sync this fork's master from upstream (preserving this workflow), and on any
-# upstream change, cross-build cmd/olcrtc for the router arches and publish a prerelease.
+# upstream change, cross-build cmd/olcrtc for the supported arches and publish a prerelease.
 # Runs on the self-hosted NL VPS runner (label: olcrtc).
 on:
   schedule:
@@ -49,15 +49,16 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Cross-build cmd/olcrtc (arm64, mipsle)
+      - name: Cross-build cmd/olcrtc (amd64, arm64, armv7, mips, mipsle)
         if: steps.sync.outputs.build == 'yes'
         run: |
           set -eux
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-arm64 ./cmd/olcrtc
-          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
-            go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-mipsle ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64                 go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-amd64  ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64                 go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-arm64  ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm   GOARM=7         go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-armv7  ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=mips  GOMIPS=softfloat go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-mips   ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-mipsle ./cmd/olcrtc
           ( cd dist && sha256sum olcrtc-* | tee SHA256SUMS )
           ls -la dist
 
@@ -71,8 +72,11 @@ jobs:
           body: |
             Automated daily build of olcRTC `./cmd/olcrtc` from upstream
             `openlibrecommunity/olcrtc@${{ steps.sync.outputs.upstream_sha }}`.
-            Targets: `linux/arm64`, `linux/mipsle` (softfloat). Built on the self-hosted NL VPS runner.
+            Targets (linux): `amd64`, `arm64`, `armv7`, `mips` (softfloat), `mipsle` (softfloat). Built on the self-hosted NL VPS runner.
           files: |
+            dist/olcrtc-linux-amd64
             dist/olcrtc-linux-arm64
+            dist/olcrtc-linux-armv7
+            dist/olcrtc-linux-mips
             dist/olcrtc-linux-mipsle
             dist/SHA256SUMS
