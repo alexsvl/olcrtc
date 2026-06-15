@@ -1,0 +1,78 @@
+name: nightly-sync-build
+# Daily: sync this fork's master from upstream (preserving this workflow), and on any
+# upstream change, cross-build cmd/olcrtc for the router arches and publish a prerelease.
+# Runs on the self-hosted NL VPS runner (label: olcrtc).
+on:
+  schedule:
+    - cron: '23 3 * * *'   # 03:23 UTC daily (low-traffic hour for the VPS)
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: nightly-sync-build
+  cancel-in-progress: false
+jobs:
+  sync-build-release:
+    runs-on: [self-hosted, olcrtc]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Sync master from upstream
+        id: sync
+        run: |
+          set -eu
+          git config user.name  "olcrtc-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git remote add upstream https://github.com/openlibrecommunity/olcrtc.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/openlibrecommunity/olcrtc.git
+          git fetch upstream master
+          before=$(git rev-parse HEAD)
+          git merge --no-edit upstream/master
+          after=$(git rev-parse HEAD)
+          git push origin master
+          echo "upstream_sha=$(git rev-parse --short upstream/master)" >> "$GITHUB_OUTPUT"
+          if [ "$before" != "$after" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=no"  >> "$GITHUB_OUTPUT"
+          fi
+          echo "sync: before=$before after=$after event=${{ github.event_name }}"
+
+      - name: Setup Go
+        if: steps.sync.outputs.build == 'yes'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Cross-build cmd/olcrtc (arm64, mipsle)
+        if: steps.sync.outputs.build == 'yes'
+        run: |
+          set -eux
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-arm64 ./cmd/olcrtc
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+            go build -trimpath -ldflags '-s -w' -o dist/olcrtc-linux-mipsle ./cmd/olcrtc
+          ( cd dist && sha256sum olcrtc-* | tee SHA256SUMS )
+          ls -la dist
+
+      - name: Publish prerelease
+        if: steps.sync.outputs.build == 'yes'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ steps.sync.outputs.upstream_sha }}
+          name: olcRTC nightly ${{ steps.sync.outputs.upstream_sha }}
+          prerelease: true
+          body: |
+            Automated daily build of olcRTC `./cmd/olcrtc` from upstream
+            `openlibrecommunity/olcrtc@${{ steps.sync.outputs.upstream_sha }}`.
+            Targets: `linux/arm64`, `linux/mipsle` (softfloat). Built on the self-hosted NL VPS runner.
+          files: |
+            dist/olcrtc-linux-arm64
+            dist/olcrtc-linux-mipsle
+            dist/SHA256SUMS
